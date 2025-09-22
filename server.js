@@ -30,9 +30,15 @@ const verifyWebhook = (req, res, next) => {
   next();
 };
 
+// Store processed orders to prevent double deduction
+const processedOrders = new Set();
+
 // Main function to update inventory for an order
 async function updateInventoryForOrder(order) {
   console.log(`📦 Processing order ${order.id} with ${order.line_items.length} items`);
+  
+  // Track this order to prevent double deduction
+  processedOrders.add(order.id.toString());
   
   for (const lineItem of order.line_items) {
     try {
@@ -125,6 +131,72 @@ app.post('/webhooks/order-created', verifyWebhook, async (req, res) => {
   }
 });
 
+// Optional: Handle order cancellation to restore inventory
+app.post('/webhooks/order-cancelled', verifyWebhook, async (req, res) => {
+  try {
+    const order = req.body;
+    console.log(`\n❌ Order cancelled: ${order.id}`);
+    
+    // Only process if this order was handled by us
+    if (!processedOrders.has(order.id.toString())) {
+      console.log(`ℹ️ Order ${order.id} was not processed by our system, skipping`);
+      return res.status(200).send('OK');
+    }
+    
+    // Restore inventory for cancelled orders
+    for (const lineItem of order.line_items) {
+      try {
+        await updateInventoryForVariant(lineItem.variant_id, lineItem.quantity);
+        console.log(`✅ Restored inventory for variant ${lineItem.variant_id}: +${lineItem.quantity}`);
+      } catch (error) {
+        console.error(`❌ Failed to restore inventory for variant ${lineItem.variant_id}:`, error.message);
+      }
+    }
+    
+    // Remove from processed orders
+    processedOrders.delete(order.id.toString());
+    console.log(`✅ Order ${order.id} cancellation processed successfully\n`);
+    res.status(200).send('OK');
+    
+  } catch (error) {
+    console.error(`❌ Error processing order cancellation:`, error.message);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+// NEW: Handle order fulfillment to compensate for double deduction
+app.post('/webhooks/order-fulfilled', verifyWebhook, async (req, res) => {
+  try {
+    const order = req.body;
+    console.log(`\n📋 Order fulfilled: ${order.id}`);
+    
+    // Only process if this order was handled by us
+    if (!processedOrders.has(order.id.toString())) {
+      console.log(`ℹ️ Order ${order.id} was not processed by our system, skipping`);
+      return res.status(200).send('OK');
+    }
+    
+    // Compensate for Shopify's automatic deduction by adding inventory back
+    for (const lineItem of order.line_items) {
+      try {
+        await updateInventoryForVariant(lineItem.variant_id, lineItem.quantity);
+        console.log(`✅ Compensated double deduction for variant ${lineItem.variant_id}: +${lineItem.quantity}`);
+      } catch (error) {
+        console.error(`❌ Failed to compensate for variant ${lineItem.variant_id}:`, error.message);
+      }
+    }
+    
+    // Remove from processed orders as fulfillment is complete
+    processedOrders.delete(order.id.toString());
+    console.log(`✅ Order ${order.id} fulfillment compensation completed\n`);
+    res.status(200).send('OK');
+    
+  } catch (error) {
+    console.error(`❌ Error processing order fulfillment:`, error.message);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ 
@@ -151,13 +223,46 @@ app.get('/test-connection', async (req, res) => {
   }
 });
 
+// Manual test endpoint to simulate order processing (for testing purposes)
+app.post('/test/process-order', async (req, res) => {
+  try {
+    const { orderId, lineItems } = req.body;
+    
+    if (!orderId || !lineItems) {
+      return res.status(400).json({ error: 'orderId and lineItems are required' });
+    }
+
+    console.log(`\n🧪 Testing order processing: ${orderId}`);
+    
+    for (const lineItem of lineItems) {
+      await updateInventoryForVariant(lineItem.variant_id, -lineItem.quantity);
+      console.log(`✅ Test: Updated inventory for variant ${lineItem.variant_id}: -${lineItem.quantity}`);
+    }
+    
+    res.status(200).json({ 
+      status: 'success', 
+      message: `Test order ${orderId} processed successfully` 
+    });
+    
+  } catch (error) {
+    console.error('❌ Test order processing failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Shopify Inventory Updater running on port ${PORT}`);
-  console.log(`📡 Webhook endpoint: http://localhost:${PORT}/webhooks/order-created`);
+  console.log(`📡 Webhook endpoints:`);
+  console.log(`   - Order Created: http://localhost:${PORT}/webhooks/order-created`);
+  console.log(`   - Order Cancelled: http://localhost:${PORT}/webhooks/order-cancelled`);
+  console.log(`   - Order Fulfilled: http://localhost:${PORT}/webhooks/order-fulfilled`);
   console.log(`🏥 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 Test connection: http://localhost:${PORT}/test-connection`);
+  
+  console.log(`\n💡 This version handles double deduction by compensating on fulfillment`);
+  console.log(`💡 Alternative: Disable 'Reduce inventory on fulfillment' in Shopify settings`);
 });
 
 module.exports = app;
